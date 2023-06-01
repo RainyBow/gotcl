@@ -11,5 +11,7 @@
 # limit
   * Interpreter 执行时有锁,所以不能并行执行
   * 只能指定Tcl脚本，不能自定义Tcl命令
-  
 
+
+# 参考
+  * https://github.com/nsf/gothic.git
