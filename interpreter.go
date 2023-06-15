@@ -14,23 +14,23 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
 	"sync"
 	"unsafe"
 )
 
 type interpreter struct {
-	C      *C.Tcl_Interp
-	thread C.Tcl_ThreadId
+	C *C.Tcl_Interp
+	// thread C.Tcl_ThreadId
 	cmdbuf bytes.Buffer
-	lock   *sync.Mutex
 }
 
 func new_interpreter() (*interpreter, error) {
 	ir := &interpreter{
-		C:      C.Tcl_CreateInterp(),
-		thread: C.Tcl_GetCurrentThread(),
-		lock:   &sync.Mutex{},
+		C: C.Tcl_CreateInterp(),
+		// thread: C.Tcl_GetCurrentThread(),
 	}
+	// log.Printf("thread id :%v", ir.thread)
 	status := C.Tcl_Init(ir.C)
 	if status != C.TCL_OK {
 		return nil, errors.New(C.GoString(C.Tcl_GetStringResult(ir.C)))
@@ -109,6 +109,7 @@ func (ir *interpreter) tcl_obj_to_go_value(obj *C.Tcl_Obj, v reflect.Value) erro
 type Interpreter struct {
 	ir   *interpreter
 	lock *sync.Mutex
+	done chan struct{}
 }
 
 /*
@@ -119,22 +120,50 @@ func NewInterpreter(initscript string) (ir *Interpreter, err error) {
 
 	ir = new(Interpreter)
 	ir.lock = &sync.Mutex{}
-	ir.ir, err = new_interpreter()
-	if err != nil {
-		return nil, err
-	}
-	if len(initscript) > 0 {
-		err = ir.ir.eval([]byte(initscript))
-		if err != nil {
-			return nil, err
-		}
-	}
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	ir.done = done
+	go func() {
+		runtime.LockOSThread()
+		ir.ir, err = new_interpreter()
+		if err == nil && len(initscript) > 0 {
+			err = ir.ir.eval([]byte(initscript))
 
-	return ir, nil
+		}
+
+		ready <- struct{}{}
+		<-ir.done
+
+		C.Tcl_DeleteInterp(ir.ir.C)
+		//C.Tcl_FinalizeThread()
+		// C.Tcl_ExitThread(0)
+		ir.ir = nil
+		ir.lock.Unlock()
+	}()
+	<-ready
+	return
 }
 
-func appInitProc(*C.Tcl_Interp) int {
-	return 0
+// Free TCL Interpreter
+func (ir *Interpreter) Free() {
+	if ir.ir != nil {
+		ir.lock.Lock()
+		ir.done <- struct{}{}
+		ir.lock.Lock()
+		defer ir.lock.Unlock()
+	}
+
+}
+
+func (ir *Interpreter) try_lock() error {
+	if ir.ir != nil {
+		ir.lock.Lock()
+		return nil
+	}
+	return fmt.Errorf("interpreter has been freed")
+}
+func (ir *Interpreter) free() {
+	ir.lock.Unlock()
 }
 
 // Queue script for evaluation and wait for its completion. This function uses
@@ -184,7 +213,9 @@ func appInitProc(*C.Tcl_Interp) int {
 //  5. gothic.Eval("%{%q}", "[command $variable]")
 //     `"\[command \$variable\]"`
 func (ir *Interpreter) Eval(format string, args ...interface{}) error {
-	ir.lock.Lock()
+	if err := ir.try_lock(); err != nil {
+		return err
+	}
 	defer ir.lock.Unlock()
 	ir.ir.cmdbuf.Reset()
 	if err := sprintf(&ir.ir.cmdbuf, format, args...); err != nil {
@@ -196,7 +227,9 @@ func (ir *Interpreter) Eval(format string, args ...interface{}) error {
 // Works the same way as Eval("%{}", byte_slice), but avoids unnecessary
 // buffering.
 func (ir *Interpreter) EvalBytes(s []byte) error {
-	ir.lock.Lock()
+	if err := ir.try_lock(); err != nil {
+		return err
+	}
 	defer ir.lock.Unlock()
 	return ir.ir.eval(s)
 
@@ -205,7 +238,9 @@ func (ir *Interpreter) EvalBytes(s []byte) error {
 // Works exactly as Eval with exception that it writes the result of executed
 // code into `out`.
 func (ir *Interpreter) EvalAs(out interface{}, format string, args ...interface{}) error {
-	ir.lock.Lock()
+	if err := ir.try_lock(); err != nil {
+		return err
+	}
 	defer ir.lock.Unlock()
 	ir.ir.cmdbuf.Reset()
 	if err := sprintf(&ir.ir.cmdbuf, format, args...); err != nil {
